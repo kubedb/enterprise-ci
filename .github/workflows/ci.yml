@@ -1,0 +1,122 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - "*"
+  push:
+    branches:
+      - master
+
+jobs:
+  kubernetes:
+    name: Kubernetes
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        cluster: [v1.12.10, v1.14.10, v1.16.9, v1.18.2]
+    steps:
+      - name: Set up Go 1.14
+        uses: actions/setup-go@v1
+        with:
+          go-version: 1.14
+        id: go
+
+      - uses: actions/checkout@v1
+
+      - name: Prepare git
+        env:
+          GITHUB_USER: 1gtm
+          GITHUB_TOKEN: ${{ secrets.LGTM_GITHUB_TOKEN }}
+        run: |
+          git config --global user.name "${GITHUB_USER}"
+          git config --global user.email "${GITHUB_USER}@appscode.com"
+          git remote set-url origin https://${GITHUB_USER}:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git
+
+      - name: Prepare Host
+        run: |
+          # install kind
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.8.1/kind-$(uname)-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          # install kubectl
+          curl -LO https://storage.googleapis.com/kubernetes-release/release/v1.17.0/bin/linux/amd64/kubectl
+          chmod +x ./kubectl
+          sudo mv ./kubectl /usr/local/bin/kubectl
+          # remove installer
+          rm -rf ../installer
+
+      - name: Create Kubernetes ${{ matrix.cluster }} cluster
+        run: |
+          kind delete cluster || true
+          docker pull kindest/node:${{ matrix.cluster }} # ensure always using latest image
+          kind create cluster --config hack/kubernetes/kind.yaml --image kindest/node:${{ matrix.cluster }}
+
+      - name: Prepare cluster for testing
+        id: local-path
+        env:
+          USERNAME: 1gtm
+          REGISTRY_SECRET: regcred
+          GCR_SERVICE_ACCOUNT_JSON_KEY: ${{ secrets.CI_GCR_SERVICE_ACCOUNT_JSON_KEY }}
+        run: |
+          echo "waiting for nodes to be ready ..."
+          kubectl wait --for=condition=Ready nodes --all --timeout=5m
+          kubectl get nodes
+          echo
+          echo "install helm 3"
+          curl https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3 | bash
+          echo
+          echo "create docker-registry secret"
+          kubectl create secret docker-registry ${REGISTRY_SECRET} \
+            --namespace=kube-system \
+            --docker-server=https://gcr.io \
+            --docker-username=_json_key \
+            --docker-email=${USERNAME}@appscode.com \
+            --docker-password="$(echo $GCR_SERVICE_ACCOUNT_JSON_KEY)"
+
+      - name: Install cert-manager
+        run: |
+          kubectl create namespace cert-manager
+          # ref: https://github.com/cloudflare/semver_bash/blob/master/semver.sh#L3
+          RE='[^0-9]*\([0-9]*\)[.]\([0-9]*\)[.]\([0-9]*\)\([0-9A-Za-z-]*\)'
+          eval MAJOR=`echo ${{ matrix.cluster }} | sed -e "s#$RE#\1#"`
+          eval MINOR=`echo ${{ matrix.cluster }} | sed -e "s#$RE#\2#"`
+          if [ $MAJOR -eq 1 ] && [ $MINOR -lt 15 ]; then
+            kubectl apply --validate=false -f https://github.com/jetstack/cert-manager/releases/download/v0.15.1/cert-manager-legacy.yaml
+          else
+            kubectl apply --validate=false -f https://github.com/jetstack/cert-manager/releases/download/v0.15.1/cert-manager.yaml
+          fi
+
+      - name: Check out installer
+        run: |
+          cd ..
+          git clone https://github.com/kubedb/installer.git
+          cd installer
+          git checkout master
+
+      - name: Run e2e tests
+        env:
+          REGISTRY: gcr.io/appscode-ci
+          REGISTRY_SECRET: regcred
+          TEST_CREDENTIALS: ${{ secrets.TEST_CREDENTIALS }}
+          GCR_SERVICE_ACCOUNT_JSON_KEY: ${{ secrets.CI_GCR_SERVICE_ACCOUNT_JSON_KEY }}
+          GITHUB_USER: 1gtm
+          GITHUB_TOKEN: ${{ secrets.LGTM_GITHUB_TOKEN }}
+        run: |
+          # https://stackoverflow.com/a/30969768/244009
+          set -o allexport
+          source event.env
+          set +o allexport
+          # check out enterprise operator
+          cd ..
+          git clone https://${GITHUB_USER}:${GITHUB_TOKEN}@$PR_REPO_URL.git
+          cd $(basename $PR_REPO_URL)
+          git checkout $PR_HEAD_SHA
+          echo "preparing test credentials"
+          mkdir -p hack/config
+          echo -n "$TEST_CREDENTIALS" > hack/config/.env
+          echo >> hack/config/.env
+          echo "GCR_SERVICE_ACCOUNT_JSON_KEY=$(echo $GCR_SERVICE_ACCOUNT_JSON_KEY)" >> hack/config/.env
+          make install
+          echo
+          make e2e-tests || (kubectl describe deployment -n kube-system kubedb-enterprise; kubectl logs -n kube-system deployment/kubedb-enterprise; exit 1;)
